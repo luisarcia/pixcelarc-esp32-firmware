@@ -1,0 +1,533 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_NeoMatrix.h>
+#include <Adafruit_NeoPixel.h>
+#include <LittleFS.h>
+
+//FINAL
+
+const char *ssid = "LARCNET Domotic";
+const char *password = "ULep9vrPaPda";
+bool screenOn = true;
+
+#define W 16
+#define H 16
+#define PIN 32
+#define BRIGHTNESS 20
+#define MAX_ANIMS 10
+
+const size_t frameSize = W * H * 3;
+
+// --- Playlist --- ✅ sin buffer en RAM, solo metadata
+struct Animation {
+  size_t frameCount;
+  size_t byteLength;
+};
+
+Animation playlist[MAX_ANIMS];
+int playlistCount = 0;
+
+// --- Config ---
+uint8_t fps = 12;
+uint32_t frameDelay = 1000 / fps;
+uint8_t animRepeats = 2;
+
+// --- Control ---
+bool newAnimPending = false;
+
+// --- Upload buffer temporal --- ✅ solo durante el upload
+static uint8_t *uploadBuffer = nullptr;
+static size_t uploadReceived = 0;
+static int uploadSlot = -1;
+
+TaskHandle_t animTaskHandle = NULL;
+SemaphoreHandle_t animMutex;
+
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
+  W, H, 1, 1, PIN,
+  NEO_MATRIX_TOP + NEO_MATRIX_RIGHT + NEO_MATRIX_ROWS + NEO_MATRIX_ZIGZAG,
+  NEO_GRB + NEO_KHZ800);
+
+AsyncWebServer server(80);
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+void sendCORS(AsyncWebServerRequest *request, int code, const char *content) {
+  AsyncWebServerResponse *response = request->beginResponse(code, "text/plain", content);
+  response->addHeader("Access-Control-Allow-Origin", "*");
+  response->addHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  response->addHeader("Access-Control-Allow-Headers", "*");
+  request->send(response);
+}
+
+String playlistFilename(int index) {
+  return "/anim/anim" + String(index) + ".bin";
+}
+
+// ── Animaciones de arranque ────────────────────────────────────────────────
+void scrollText(String text, uint16_t color) {
+  int textLen = text.length() * 6;
+  int endX = -textLen;
+  matrix.setTextWrap(false);
+  matrix.setTextSize(1);
+  matrix.setTextColor(color);
+  for (int x = W; x >= endX; x--) {
+    matrix.fillScreen(0);
+    matrix.setCursor(x, 4);
+    matrix.print(text);
+    matrix.show();
+    delay(40);
+  }
+}
+
+void wifiConnectingAnimation() {
+  uint16_t orange = matrix.Color(255, 100, 0);
+  uint8_t pos = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    matrix.fillScreen(0);
+    for (int x = 1; x <= 14; x++) {
+      matrix.drawPixel(x, 6, matrix.Color(40, 40, 40));
+      matrix.drawPixel(x, 9, matrix.Color(40, 40, 40));
+    }
+    matrix.drawPixel(0, 7, matrix.Color(40, 40, 40));
+    matrix.drawPixel(0, 8, matrix.Color(40, 40, 40));
+    matrix.drawPixel(15, 7, matrix.Color(40, 40, 40));
+    matrix.drawPixel(15, 8, matrix.Color(40, 40, 40));
+    for (int x = 1; x <= pos; x++) {
+      matrix.drawPixel(x, 7, orange);
+      matrix.drawPixel(x, 8, orange);
+    }
+    matrix.show();
+    delay(120);
+    pos++;
+    if (pos > 14) pos = 0;
+  }
+}
+
+void wifiConnectedAnimation() {
+  uint16_t green = matrix.Color(0, 220, 80);
+  matrix.fillScreen(0);
+  for (int x = 1; x <= 14; x++) {
+    matrix.drawPixel(x, 6, matrix.Color(20, 60, 20));
+    matrix.drawPixel(x, 9, matrix.Color(20, 60, 20));
+    matrix.drawPixel(x, 7, green);
+    matrix.drawPixel(x, 8, green);
+  }
+  matrix.drawPixel(0, 7, matrix.Color(20, 60, 20));
+  matrix.drawPixel(0, 8, matrix.Color(20, 60, 20));
+  matrix.drawPixel(15, 7, matrix.Color(20, 60, 20));
+  matrix.drawPixel(15, 8, matrix.Color(20, 60, 20));
+  matrix.show();
+  delay(2000);
+
+  String ip = WiFi.localIP().toString();
+  uint16_t cyan = matrix.Color(0, 200, 220);
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    scrollText(ip, cyan);
+  }
+  matrix.fillScreen(0);
+  matrix.show();
+}
+
+// ── LittleFS ───────────────────────────────────────────────────────────────
+bool saveAnimToFS(int index, uint8_t *data, size_t length) {
+  String path = playlistFilename(index);
+  File f = LittleFS.open(path, "w");
+  if (!f) {
+    Serial.printf("❌ No se pudo abrir %s\n", path.c_str());
+    return false;
+  }
+  size_t written = f.write(data, length);
+  f.close();
+  Serial.printf("💾 Anim %d guardada (%u bytes)\n", index, written);
+  return written == length;
+}
+
+bool loadPlaylistMetaFromFS() {
+  playlistCount = 0;
+  for (int i = 0; i < MAX_ANIMS; i++) {
+    String path = playlistFilename(i);
+    if (!LittleFS.exists(path)) break;
+    File f = LittleFS.open(path, "r");
+    if (!f) break;
+    size_t size = f.size();
+    f.close();
+    if (size == 0 || size % frameSize != 0) break;
+    playlist[i].byteLength = size;
+    playlist[i].frameCount = size / frameSize;
+    playlistCount++;
+    Serial.printf("📂 Anim %d registrada (%u bytes, %u frames)\n", i, size, size / frameSize);
+  }
+  Serial.printf("📋 Playlist: %d animaciones\n", playlistCount);
+  return playlistCount > 0;
+}
+
+void saveMetaToFS() {
+  File f = LittleFS.open("/anim/meta.txt", "w");
+  if (!f) return;
+  f.printf("%u\n%u\n%d\n%d\n", frameDelay, animRepeats, playlistCount, (int)screenOn);
+  f.close();
+}
+
+void loadMetaFromFS() {
+  if (!LittleFS.exists("/anim/meta.txt")) return;
+  File f = LittleFS.open("/anim/meta.txt", "r");
+  if (!f) return;
+  frameDelay    = f.readStringUntil('\n').toInt();
+  animRepeats   = f.readStringUntil('\n').toInt();
+  playlistCount = f.readStringUntil('\n').toInt();
+  screenOn      = f.readStringUntil('\n').toInt() != 0;
+  f.close();
+  Serial.printf("📋 Meta cargada: delay=%u repeats=%u screenOn=%d\n", frameDelay, animRepeats, screenOn);
+}
+
+size_t calcFsUsedReal() {
+  size_t total = 0;
+  File root = LittleFS.open("/anim");
+  if (!root || !root.isDirectory()) return 0;
+  File f = root.openNextFile();
+  while (f) {
+    total += f.size();
+    f = root.openNextFile();
+  }
+  return total;
+}
+
+// ── Render — lee directo de LittleFS, sin buffer en RAM ───────────────────
+bool renderAnimation(int index, uint8_t repeats, uint32_t delay_ms) {
+  String path = playlistFilename(index);
+  uint8_t frame[frameSize];  // ✅ solo 1 frame en RAM = 768 bytes
+
+  for (uint8_t r = 0; r < repeats; r++) {
+    File f = LittleFS.open(path, "r");
+    if (!f) return true;  // skip si no existe
+
+    while (f.available() >= (int)frameSize) {
+      if (newAnimPending) {
+        newAnimPending = false;
+        f.close();
+        return false;
+      }
+
+      size_t bytesRead = f.read(frame, frameSize);
+      if (bytesRead != frameSize) break;
+
+      for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+          int idx = (y * W + x) * 3;
+          matrix.drawPixel(x, y, matrix.Color(frame[idx], frame[idx + 1], frame[idx + 2]));
+        }
+      }
+      matrix.show();
+      vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    f.close();
+  }
+  return true;
+}
+
+// ── Tarea ──────────────────────────────────────────────────────────────────
+void animateLoop(void *) {
+  while (true) {
+    xSemaphoreTake(animMutex, portMAX_DELAY);
+    int count = playlistCount;
+    uint32_t delay_ms = frameDelay;
+    uint8_t repeats = animRepeats;
+    xSemaphoreGive(animMutex);
+
+    if (count == 0) {
+      matrix.fillScreen(0);
+      matrix.show();
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    for (int i = 0; i < count; i++) {
+      bool completed = renderAnimation(i, repeats, delay_ms);
+      if (!completed) break;
+    }
+  }
+}
+
+void startAnimation() {
+  if (animTaskHandle == NULL) {
+    xTaskCreatePinnedToCore(animateLoop, "AnimTask", 4096, NULL, 1, &animTaskHandle, 1);
+  }
+}
+
+// ── Setup ──────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("PSRAM: %u bytes\n", ESP.getPsramSize());
+  Serial.printf("🧠 Heap total: %u bytes\n", ESP.getHeapSize());
+  Serial.printf("🧠 Heap libre: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("🧠 Bloque máx: %u bytes\n", ESP.getMaxAllocHeap());
+
+  matrix.begin();
+  matrix.setBrightness(BRIGHTNESS);
+  matrix.fillScreen(0);
+  matrix.show();
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("❌ LittleFS falló");
+  } else {
+    Serial.println("✅ LittleFS montado");
+    LittleFS.mkdir("/anim");
+    loadMetaFromFS();
+    loadPlaylistMetaFromFS();
+  }
+
+  WiFi.begin(ssid, password);
+  wifiConnectingAnimation();
+  Serial.println("\nWiFi conectado — IP: " + WiFi.localIP().toString());
+  wifiConnectedAnimation();
+
+  animMutex = xSemaphoreCreateMutex();
+  startAnimation();
+
+  // ✅ Restaurar estado on/off persistido
+  if (!screenOn) {
+    vTaskSuspend(animTaskHandle);
+    matrix.fillScreen(0);
+    matrix.show();
+    Serial.println("🔌 Pantalla inicia apagada (estado persistido)");
+  }
+
+  // ── /meta ─────────────────────────────────────────────────────────────────
+  server.on("/meta", HTTP_OPTIONS, [](AsyncWebServerRequest *r) {
+    sendCORS(r, 200, "OK");
+  });
+  server.on(
+    "/meta", HTTP_POST, [](AsyncWebServerRequest *r) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body;
+      body.reserve(len);
+      for (size_t i = 0; i < len; i++) body += (char)data[i];
+      Serial.println("📋 Meta: " + body);
+
+      int di = body.indexOf("\"delay\"");
+      int fi = body.indexOf("\"fps\"");
+      int ri = body.indexOf("\"repeats\":");
+
+      if (di >= 0) {
+        int c = body.indexOf(':', di);
+        if (c >= 0) frameDelay = (uint32_t)body.substring(c + 1).toInt();
+      } else if (fi >= 0) {
+        int c = body.indexOf(':', fi);
+        if (c >= 0) {
+          int f = body.substring(c + 1).toInt();
+          if (f > 0) frameDelay = 1000 / f;
+        }
+      }
+      if (ri >= 0) {
+        int c = body.indexOf(':', ri);
+        if (c >= 0) {
+          int rep = body.substring(c + 1).toInt();
+          if (rep > 0) animRepeats = (uint8_t)rep;
+        }
+      }
+
+      Serial.printf("⏱ frameDelay=%u ms | repeats=%u\n", frameDelay, animRepeats);
+      saveMetaToFS();
+      sendCORS(request, 200, "OK");
+    });
+
+  // ── /upload ───────────────────────────────────────────────────────────────
+  server.on("/upload", HTTP_OPTIONS, [](AsyncWebServerRequest *r) {
+    sendCORS(r, 200, "OK");
+  });
+  server.on(
+    "/upload", HTTP_POST, [](AsyncWebServerRequest *r) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        uploadReceived = 0;
+        Serial.printf("🧠 Heap libre: %u bytes\n", ESP.getFreeHeap());
+        Serial.printf("🧠 Bloque máx: %u bytes\n", ESP.getMaxAllocHeap());
+        Serial.printf("📦 Intentando malloc: %u bytes\n", total);
+
+        xSemaphoreTake(animMutex, portMAX_DELAY);
+        if (playlistCount >= MAX_ANIMS) {
+          xSemaphoreGive(animMutex);
+          sendCORS(request, 507, "❌ Playlist llena (máx 10)");
+          return;
+        }
+        uploadSlot = playlistCount;
+        xSemaphoreGive(animMutex);
+
+        uploadBuffer = (uint8_t *)malloc(total);
+        if (!uploadBuffer) {
+          uploadSlot = -1;
+          sendCORS(request, 500, "❌ Sin memoria");
+          return;
+        }
+        Serial.printf("✅ Upload buffer asignado slot %d\n", uploadSlot);
+      }
+
+      if (uploadSlot < 0 || !uploadBuffer) return;
+
+      memcpy(uploadBuffer + index, data, len);
+      uploadReceived += len;
+
+      if (index + len == total) {
+        if (total % frameSize != 0) {
+          free(uploadBuffer);
+          uploadBuffer = nullptr;
+          uploadSlot = -1;
+          sendCORS(request, 400, "❌ Longitud incorrecta");
+          return;
+        }
+
+        bool saved = saveAnimToFS(uploadSlot, uploadBuffer, total);
+
+        free(uploadBuffer);
+        uploadBuffer = nullptr;
+
+        if (!saved) {
+          uploadSlot = -1;
+          sendCORS(request, 500, "❌ Error al guardar en flash");
+          return;
+        }
+
+        xSemaphoreTake(animMutex, portMAX_DELAY);
+        playlist[uploadSlot].byteLength = total;
+        playlist[uploadSlot].frameCount = total / frameSize;
+        playlistCount++;
+        newAnimPending = true;
+        xSemaphoreGive(animMutex);
+
+        saveMetaToFS();
+
+        Serial.printf("✅ Anim %d agregada (%u frames) — playlist: %d\n",
+                      uploadSlot, total / frameSize, playlistCount);
+        Serial.printf("🧠 Heap libre post-upload: %u bytes\n", ESP.getFreeHeap());
+        uploadSlot = -1;
+        sendCORS(request, 200, "✅ Animación agregada");
+      }
+    });
+
+  // ── /clear ────────────────────────────────────────────────────────────────
+  server.on("/clear", HTTP_OPTIONS, [](AsyncWebServerRequest *r) {
+    sendCORS(r, 200, "OK");
+  });
+  server.on("/clear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool hasIndex = request->hasParam("index");
+    xSemaphoreTake(animMutex, portMAX_DELAY);
+
+    if (hasIndex) {
+      int idx = request->getParam("index")->value().toInt();
+      if (idx < 0 || idx >= playlistCount) {
+        xSemaphoreGive(animMutex);
+        sendCORS(request, 400, "❌ Índice inválido");
+        return;
+      }
+      for (int i = idx; i < playlistCount - 1; i++) playlist[i] = playlist[i + 1];
+      playlist[playlistCount - 1] = { 0, 0 };
+      playlistCount--;
+      newAnimPending = true;
+      xSemaphoreGive(animMutex);
+
+      for (int i = 0; i < MAX_ANIMS; i++) LittleFS.remove(playlistFilename(i));
+      for (int i = idx; i < playlistCount; i++) {
+        String src = "/anim/anim" + String(i + 1) + ".bin";
+        String dst = "/anim/anim" + String(i) + ".bin";
+        File fsrc = LittleFS.open(src, "r");
+        File fdst = LittleFS.open(dst, "w");
+        if (fsrc && fdst) {
+          uint8_t chunk[512];
+          while (fsrc.available()) {
+            size_t n = fsrc.read(chunk, sizeof(chunk));
+            fdst.write(chunk, n);
+          }
+        }
+        if (fsrc) fsrc.close();
+        if (fdst) fdst.close();
+        LittleFS.remove(src);
+      }
+      saveMetaToFS();
+
+      Serial.printf("🗑 Anim %d eliminada — playlist: %d\n", idx, playlistCount);
+      sendCORS(request, 200, "✅ Animación eliminada");
+
+    } else {
+      playlistCount = 0;
+      newAnimPending = true;
+      xSemaphoreGive(animMutex);
+
+      for (int i = 0; i < MAX_ANIMS; i++) LittleFS.remove(playlistFilename(i));
+      LittleFS.remove("/anim/meta.txt");
+
+      Serial.println("🗑 Playlist completa borrada");
+      sendCORS(request, 200, "✅ Playlist borrada");
+    }
+  });
+
+  // ── /playlist ─────────────────────────────────────────────────────────────
+  server.on("/playlist", HTTP_GET, [](AsyncWebServerRequest *request) {
+    size_t fsUsedReal = calcFsUsedReal();
+    String json = "{\"count\":" + String(playlistCount);
+    json += ",\"maxAnims\":" + String(MAX_ANIMS);
+    json += ",\"frameDelay\":" + String(frameDelay);
+    json += ",\"repeats\":" + String(animRepeats);
+    json += ",\"screenOn\":" + String(screenOn ? "true" : "false");
+    json += ",\"heapFree\":" + String(ESP.getFreeHeap());
+    json += ",\"heapMax\":" + String(ESP.getMaxAllocHeap());
+    json += ",\"fsTotal\":" + String(LittleFS.totalBytes());
+    json += ",\"fsUsed\":" + String(fsUsedReal);
+    json += ",\"fsFree\":" + String(LittleFS.totalBytes() - fsUsedReal);
+    json += ",\"anims\":[";
+    for (int i = 0; i < playlistCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"index\":" + String(i);
+      json += ",\"frames\":" + String(playlist[i].frameCount);
+      json += ",\"bytes\":" + String(playlist[i].byteLength) + "}";
+    }
+    json += "]}";
+    AsyncWebServerResponse *r = request->beginResponse(200, "application/json", json);
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    request->send(r);
+  });
+
+  // ── /off ──────────────────────────────────────────────────────────────────
+  server.on("/off", HTTP_OPTIONS, [](AsyncWebServerRequest *r) {
+    sendCORS(r, 200, "OK");
+  });
+  server.on("/off", HTTP_GET, [](AsyncWebServerRequest *request) {
+    xSemaphoreTake(animMutex, portMAX_DELAY);
+    newAnimPending = true;
+    xSemaphoreGive(animMutex);
+
+    if (animTaskHandle) vTaskSuspend(animTaskHandle);
+    matrix.fillScreen(0);
+    matrix.show();
+
+    screenOn = false;
+    saveMetaToFS();
+
+    sendCORS(request, 200, "✅ Pantalla apagada");
+    Serial.println("🔌 Pantalla apagada por /off");
+  });
+
+  // ── /on ───────────────────────────────────────────────────────────────────
+  server.on("/on", HTTP_OPTIONS, [](AsyncWebServerRequest *r) {
+    sendCORS(r, 200, "OK");
+  });
+  server.on("/on", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (animTaskHandle) vTaskResume(animTaskHandle);
+
+    screenOn = true;
+    saveMetaToFS();
+
+    sendCORS(request, 200, "✅ Pantalla encendida");
+    Serial.println("💡 Pantalla encendida por /on");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    sendCORS(r, 404, "Not found");
+  });
+  server.begin();
+  Serial.println("Servidor iniciado en puerto 80");
+}
+
+void loop() {}
