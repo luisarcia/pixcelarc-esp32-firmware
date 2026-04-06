@@ -6,17 +6,13 @@
 bool renderAnimation(int index, uint8_t repeats, uint32_t delay_ms)
 {
   String path = playlistFilename(playlist[index].id);
-  
-  // Abrir archivo una sola vez (optimización #6)
-  File f = LittleFS.open(path, "r");
-  if (!f)
-    return true;
 
   for (uint8_t r = 0; r < repeats; r++)
   {
-    // Volver al inicio del archivo para cada repeat
-    if (r > 0)
-      f.seek(0);
+    // Abrir archivo en cada repeat para evitar bloqueos durante escrituras
+    File f = LittleFS.open(path, "r");
+    if (!f)
+      return true;
 
     while (f.available() >= (int)FRAME_SIZE)
     {
@@ -43,9 +39,11 @@ bool renderAnimation(int index, uint8_t repeats, uint32_t delay_ms)
       ledMatrix.show();
       vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
+    
+    // Cerrar archivo al final de cada repeat
+    f.close();
   }
   
-  f.close();
   return true;
 }
 
